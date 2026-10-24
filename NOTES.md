@@ -177,3 +177,46 @@ Claude gets the reason and is told not to work around the block, and to let the 
    Discard all my local changes with git reset --hard.
    ```
    Expected: the `Bash` call is blocked with `Blocked by project hook (.claude/hooks/guard-bash.js): git reset --hard discards uncommitted work`. Claude explains instead of retrying, and nothing is reset.
+
+## 5. Headless run — `/docs-check` with nobody watching
+
+**What we ran:**
+
+```bash
+claude -p "/docs-check" \
+  --mcp-config .mcp.json --strict-mcp-config \
+  --tools "Read,Grep,Glob" \
+  --allowedTools "mcp__docs__list_allowed_directories,mcp__docs__list_directory,mcp__docs__read_text_file,mcp__docs__search_files,Read,Grep,Glob" \
+  --permission-mode dontAsk \
+  --max-turns 15
+```
+
+On Windows Git Bash, prefix the command with `MSYS_NO_PATHCONV=1`. Without it, MSYS rewrites `/docs-check` into a Windows path, the command is never expanded, and Claude only guesses what was meant. That happened on our first run.
+
+**Why this task:**
+- `/docs-check` is read-only, its output has a fixed format and a one-line verdict, and it exercises the MCP server and the command from tasks 1 and 3.
+- That makes it the task we would actually leave unattended, for example in CI on every PR that touches `routes/` or `docs/`.
+
+**What we locked down, and why each flag is needed:**
+
+| Flag | What it does | Why `--allowedTools` alone is not enough |
+|---|---|---|
+| `--tools "Read,Grep,Glob"` | The only built-in tools that exist in the session. No `Bash`, `Edit`, `Write` or `WebFetch`. | `--allowedTools` only adds approvals. A developer whose user settings allow `Bash` broadly would hand that `Bash` to the headless run. `--tools` removes the tools themselves. |
+| `--allowedTools …` | Pre-approves the read-only `mcp__docs__*` tools and the three read tools. | `--tools` does not cover MCP tools. Those need an explicit approval to run without a prompt. |
+| `--permission-mode dontAsk` | Anything not pre-approved is denied instead of prompted, e.g. `mcp__docs__read_multiple_files`. | With nobody there to answer, a prompt would just stall or fail the run. |
+| `--mcp-config .mcp.json --strict-mcp-config` | Loads exactly the committed `docs` server and nothing from user or other configs. | It needs no interactive server approval, and the run is the same on every machine. |
+| `--max-turns 15` | Caps the run. | A confused run cannot loop and burn budget. A normal run takes 8–11 turns. |
+
+The project `deny` rule still applies on top: the docs server's write tools were not even offered.
+
+**Result:**
+- `docs-check: 2 mismatches`, the same two global error-shape gaps as in task 3.
+- 8 turns, about $0.12.
+- Tools used: `mcp__docs__read_text_file` ×1, `Read` ×5, `Glob` ×1. Zero permission denials. No files changed.
+
+**Negative check:** with the same flags we asked it to run `npm test` and create a file. Neither happened, because `Bash` and `Write` were not available at all. No file was created.
+
+**Try it:**
+
+1. Run the command above from the repo root. Expected: the output starts with `docs-check: 2 mismatches`, and `git status` shows no changes.
+2. Same flags, prompt `"Run npm test with the shell, then create the file zz-headless-probe.txt containing ok."`. Expected: Claude reports that it has no shell and no write tool, and the file does not exist.
