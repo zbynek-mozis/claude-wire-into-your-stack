@@ -1,6 +1,48 @@
 # NOTES
 
-How Claude is wired into this repo, and why each choice was made.
+How Claude is wired into this repo, and why each choice was made. The summary answers the five questions from the README. The numbered sections below hold the details, the evidence, and a **Try it** block with prompts that check each piece on a fresh clone.
+
+**Before you start on a fresh clone:**
+1. Run `npm ci`.
+2. Start `claude` in the repo root.
+3. Accept the folder trust dialog. Until you do, Claude Code ignores `permissions` in `.claude/settings.json`.
+4. Approve the `docs` MCP server.
+
+## Summary
+
+**Which server did you connect, why is it useful here, and what did your permission rule allow?**
+- We connected the official filesystem MCP server as `docs`. It is pinned to 2.0.0, started with plain `npx`, and jailed to `docs/`. It needs no credentials and no runtime beyond the Node the repo already requires.
+- It is useful because `docs/api.md` is the API contract, and checking routes against it is something we repeat. `/docs-check` and the headless run are built on it.
+- `permissions.allow` pre-approves only the four read-only tools we use: `list_allowed_directories`, `list_directory`, `read_text_file` and `search_files`. `permissions.deny` blocks the server's write tools outright, so it can never change `docs/`.
+
+**What repeated way of working did your skill capture, and how did you word the description so it fires?**
+- `adding-api-endpoint` captures how an endpoint is changed in this repo: store → route → mount → tests (one per response path) → `docs/api.md` → lint and test. The rules alone are in `CLAUDE.md`; the skill adds the steps that get forgotten.
+- The description:
+  - leads with the trigger ("adding, changing or removing an HTTP endpoint or resource")
+  - gives four example requests, including behaviour changes that never say "endpoint"
+  - names the files it touches
+  - ends with explicit exclusions: test-only, docs-only, lint, tooling
+- It fired on 4 of 4 endpoint prompts (one of them in Czech) and stayed quiet on 3 of 3 nearby ones.
+
+**What command did you add, and what makes it worth a shortcut?**
+
+We added two commands:
+- `/docs-check [resource]` is a read-only drift check between `docs/api.md` and the routes. It has a fixed output format and a one-line verdict. We run it before every PR that touches routes, and its first run found two real gaps: HTML instead of `{ error }` for unknown routes and for malformed JSON.
+- `/new-endpoint <METHOD> <path> [what it does]` is the deliberate entry point to the skill. It adds input checks, a guard against overwriting an existing handler, and a fixed report. It takes `$ARGUMENTS` rather than `$1`/`$2`, because positional arguments are zero-based in the current CLI.
+
+**What hook did you set — does it react or prevent, and on which event?**
+
+We set two hooks, both scripted in Node so they run on every OS:
+- `lint-on-edit.js` **reacts** on `PostToolUse` (`Edit|Write`). It runs ESLint with `--fix` on the edited file and feeds what's left back to Claude with exit code 2. A lint error is then caught at the edit, not in CI.
+- `guard-bash.js` **prevents** on `PreToolUse` (`Bash|PowerShell`). It blocks force-push, `reset --hard`, `clean -f`, every form of `rm -rf`, and `npm publish`. Permissions can't hold this line, because a broad user-level `Bash` allow overrides any project prompt.
+
+**What did you run headless, and what did you lock down?**
+- We ran `/docs-check` with `claude -p`.
+- `--tools "Read,Grep,Glob"` removes `Bash`, `Edit`, `Write` and `WebFetch` from the session entirely. That matters because `--allowedTools` only adds approvals and would inherit a user-level `Bash` allow.
+- `--allowedTools` pre-approves the read-only `mcp__docs__*` tools and the three read tools.
+- `--permission-mode dontAsk` denies anything else instead of prompting.
+- `--strict-mcp-config` loads only the committed server, and `--max-turns 15` caps the run.
+- A negative check with the same flags could neither run `npm test` nor create a file.
 
 ## 1. MCP server — `docs` (filesystem, read-only on `docs/`)
 
