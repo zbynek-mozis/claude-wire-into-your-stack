@@ -114,3 +114,66 @@ To check without changing files, run the prompt with `claude -p "<prompt>" --per
    /docs-check
    ```
    Expected: the same, plus the `GET /health` row as `ok`.
+
+## 4. Hooks — lint after every edit, guard before every shell command
+
+Both hooks are committed in `.claude/settings.json`. Their logic lives in Node scripts under `.claude/hooks/`, which run on Linux, macOS and Windows without `jq` or `bash`-only tools. Node is already required by the repo. Each hook is called as `node "$CLAUDE_PROJECT_DIR/.claude/hooks/<script>.js"`, so it works from any working directory.
+
+### 4a. `lint-on-edit.js` — reacts (`PostToolUse`, matcher `Edit|Write`)
+
+**What:**
+- After Claude edits or writes a `.js`/`.cjs`/`.mjs` file inside the repo, the hook runs ESLint on that one file with `--fix`. It uses the repo's own `node_modules/eslint` and `eslint.config.js`.
+- If problems remain that `--fix` cannot resolve, it prints them in ESLint's `stylish` format on stderr and exits with code 2. Claude receives that output and fixes the problems in the same turn.
+- It skips non-JS files, files outside the repo and `node_modules/`. It also skips everything when dependencies are not installed.
+
+**Why:**
+- `npm run lint` is a CI gate, so today a lint error surfaces minutes later in the pipeline.
+- The hook moves that check to the moment of the edit, on the one file that changed. That keeps it fast and its feedback specific.
+- It reacts instead of preventing: there is nothing to block before an edit, and the value is in the feedback after it.
+- Warnings are reported too. `no-unused-vars` is a warning here, and leftovers like that are cheapest to fix while Claude still has the context.
+- A crash inside the hook itself never returns exit code 2, so a broken hook cannot block editing.
+
+### 4b. `guard-bash.js` — prevents (`PreToolUse`, matcher `Bash|PowerShell`)
+
+**What:** before any shell command runs, the hook blocks it with exit code 2 if it matches one of these rules:
+
+| Blocked | Reason |
+|---|---|
+| `git push --force` / `-f` (`--force-with-lease` is allowed) | force-pushing rewrites shared history |
+| `git reset --hard` | git reset --hard discards uncommitted work |
+| `git clean -f…` | git clean -f deletes untracked files |
+| `rm` with a recursive and a force flag in any form (`-rf`, `-fr`, `-r -f`, `-R -f`, `--recursive --force`) | rm -rf deletes files without recovery |
+| `npm publish` | npm publish releases the package publicly |
+
+Claude gets the reason and is told not to work around the block, and to let the user run the command themselves.
+
+**Why:**
+- These are the commands that destroy work or publish something, and they cannot be undone.
+- A permission rule is not enough. Many developers allow `Bash` broadly in their user settings, and a user-level allow silently overrides any prompt the project would want. A hook runs whatever the permissions say.
+- The guard covers `PowerShell` as well, because on Windows Claude Code may use it instead of Bash.
+
+**Known trade-offs:**
+- It matches text, not intent. Any command line that only contains a pattern is blocked too, such as `echo "rm -rf"`, a prompt string passed to `claude -p`, or a heredoc that writes these very notes. That happened twice while we built this. We accept those false positives: a blocked harmless command costs a sentence, a missed destructive one costs work. Text goes into files through `Edit`/`Write`, which the guard does not watch.
+- It does not try to catch deliberate obfuscation, such as variables or `eval`. It is a seatbelt, not a sandbox.
+
+### Verification
+
+- **Scripts in isolation**, with simulated hook input on stdin:
+  - 17 guard cases: every blocked form exits with 2. `git push -u`, `--force-with-lease`, `reset --soft`, `clean -n`, plain `rm`, `rm -r`, `rm -f`, `git rm -r --cached` and `rm -r a; rm -f b` exit with 0.
+  - The lint hook reports an unfixable `no-undef` error with exit 2, auto-fixes `if (!!x)` to `if (x)` with exit 0, and ignores `README.md` and files outside the repo.
+- **End to end:**
+  - The guard blocked real `Bash` calls in a live Claude Code session: `PreToolUse:Bash hook error: … Blocked by project hook … rm -rf deletes files without recovery`.
+  - In a headless run, `Write` of a file with `undefinedThing();` came back as `PostToolUse:Write hook blocking error … ESLint found problems … no-undef`.
+
+**Try it:** in a `claude` session in the repo root, with the folder trusted:
+
+1. Lint hook reacts after an edit:
+   ```
+   Create routes/scratch.js with the single line `undefinedThing();`, then tell me what feedback you got.
+   ```
+   Expected: Claude reports ESLint's `'undefinedThing' is not defined  no-undef` from the `PostToolUse:Write` hook. Delete `routes/scratch.js` afterwards.
+2. Guard prevents a destructive command:
+   ```
+   Discard all my local changes with git reset --hard.
+   ```
+   Expected: the `Bash` call is blocked with `Blocked by project hook (.claude/hooks/guard-bash.js): git reset --hard discards uncommitted work`. Claude explains instead of retrying, and nothing is reset.
