@@ -84,3 +84,33 @@ The skill also tells Claude to flag inconsistent validation between handlers, su
    Expected: only a test is written, and the skill is not loaded.
 
 To check without changing files, run the prompt with `claude -p "<prompt>" --permission-mode plan --output-format stream-json --verbose` and look for a `Skill` tool call with `"skill":"adding-api-endpoint"`.
+
+## 3. Command — `/docs-check [resource]`
+
+**What:** `.claude/commands/docs-check.md` compares `docs/api.md` with the implemented routes and reports every mismatch. It never fixes anything. The output starts with a one-line verdict (`docs-check: N mismatches`), then a per-endpoint table, then one bullet per mismatch with a `file:line` reference. `$ARGUMENTS` narrows the check to one resource; empty checks everything.
+
+**Why it is worth a shortcut:**
+- We run this check before every PR that touches routes. Typed by hand, the prompt is long, and the result depends on how carefully you word it.
+- Saved, it always checks the same things: method and path, required fields, every status code, success shape, JSON error shape. It also checks global behaviour, meaning unknown routes and malformed JSON, which a hand-written prompt usually forgets.
+- On its first run it found two real gaps.
+- It is the read-only counterpart of the `adding-api-endpoint` skill. The skill keeps docs in sync while you build; the command catches drift afterwards.
+
+**Design choices:**
+- It reads the contract through the `docs` MCP server, so the command exercises the task 1 wiring and fails loudly if the server is not connected.
+- `allowed-tools` pre-approves only read-only tools: the four `mcp__docs__*` tools, plus `Read`, `Grep` and `Glob`. `allowed-tools` only adds approvals and restricts nothing. On a machine with a broad user-level `Bash` allow, the first version started the app to probe it. The prompt therefore forbids running the app, the tests or shell commands. After that change a run used only `mcp__docs__read_text_file` and `Read`. That keeps the command identical on every machine and safe for the headless run in task 5.
+- Each finding says whether it is read from code or inferred from Express defaults, so the reader knows what was verified and what was not.
+
+**Try it:** in a `claude` session in the repo root, with the `docs` server approved:
+
+1. ```
+   /docs-check users
+   ```
+   Expected: `docs-check: 2 mismatches`. The four `/users` endpoints are `ok`. Two global mismatches:
+   - an unknown route returns Express's HTML 404
+   - a malformed JSON body returns Express's HTML 400
+
+   Both contradict the `{ "error": "message" }` promise in `docs/api.md`. No files change and no shell command runs.
+2. ```
+   /docs-check
+   ```
+   Expected: the same, plus the `GET /health` row as `ok`.
