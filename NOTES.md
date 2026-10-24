@@ -115,6 +115,37 @@ To check without changing files, run the prompt with `claude -p "<prompt>" --per
    ```
    Expected: the same, plus the `GET /health` row as `ok`.
 
+## 3b. Command — `/new-endpoint <METHOD> <path> [what it does]`
+
+**What:** `.claude/commands/new-endpoint.md` scaffolds one new endpoint end to end (store → route → mount → tests → docs) and finishes with `npm run lint` and `npm test`. The work itself is delegated to the `adding-api-endpoint` skill, so the procedure lives in one place. The command adds what the skill can't:
+- input checks: the method must be one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and the path must start with `/`
+- a duplicate check: an existing handler for the same method and path stops the command, which never rewrites
+- one clarifying question when the behaviour can't be inferred
+- a fixed report: files changed, final lint/test result, and things noticed but left alone
+
+**Why it is worth a shortcut alongside the skill:** the skill fires when Claude recognises endpoint work in free text. The command is the deliberate entry point when you already know the method and path. It is one line instead of a paragraph, and its guards make it safe to fire quickly. `allowed-tools` pre-approves only reading, editing, `npm test` and `npm run lint`.
+
+**Why `$ARGUMENTS` and not `$1`/`$2`:** we probed the substitution in Claude Code 2.1.292. Positional arguments are zero-based there: `$0` = `DELETE`, `$1` = `/users/:id`. The README's `$1`/`$2` would therefore shift every field by one. Our first version did exactly that and only worked because Claude noticed. A command whose meaning depends on the CLI version is not something to commit for a team, so the command takes the whole `$ARGUMENTS` and the prompt splits it into method, path and behaviour.
+
+**Verification:** headless, in a throwaway git worktree, so the branch stayed clean:
+
+| Input | Result |
+|---|---|
+| `/new-endpoint DELETE /users/:id remove a user` | Loaded `adding-api-endpoint`. Added `deleteUser` in `db/store.js`, the handler in `routes/users.js` (204, or 404 `{ error }`), 2 tests and a `docs/api.md` section. Lint clean, 7/7 tests pass. 13 turns. |
+| `/new-endpoint FETCH /users` | Stopped with the usage hint, no changes. 1 turn. |
+| `/new-endpoint GET /users/:id` | Stopped and pointed to `routes/users.js:11-18`, no changes. 3 turns. |
+
+**Try it:** in a `claude` session on a scratch branch:
+
+1. ```
+   /new-endpoint DELETE /users/:id remove a user
+   ```
+   Expected: four files change (`db/store.js`, `routes/users.js`, `tests/users.test.js`, `docs/api.md`), `server.js` stays as it is, and the report ends with passing lint and 7/7 tests. Discard the changes afterwards.
+2. ```
+   /new-endpoint GET /users/:id
+   ```
+   Expected: Claude stops and points to the existing handler, and nothing changes.
+
 ## 4. Hooks — lint after every edit, guard before every shell command
 
 Both hooks are committed in `.claude/settings.json`. Their logic lives in Node scripts under `.claude/hooks/`, which run on Linux, macOS and Windows without `jq` or `bash`-only tools. Node is already required by the repo. Each hook is called as `node "$CLAUDE_PROJECT_DIR/.claude/hooks/<script>.js"`, so it works from any working directory.
@@ -132,6 +163,8 @@ Both hooks are committed in `.claude/settings.json`. Their logic lives in Node s
 - It reacts instead of preventing: there is nothing to block before an edit, and the value is in the feedback after it.
 - Warnings are reported too. `no-unused-vars` is a warning here, and leftovers like that are cheapest to fix while Claude still has the context.
 - A crash inside the hook itself never returns exit code 2, so a broken hook cannot block editing.
+
+**Known trade-off:** the hook sees one edit at a time. In a change that spans several edits it can report problems that are only temporary. During the `/new-endpoint` run, it flagged "`deleteUser` is assigned but never used" between adding the function and exporting it, and the warning cleared with the next edit. We accept that noise: it costs one extra look, and a real leftover gets caught at the edit that introduced it.
 
 ### 4b. `guard-bash.js` — prevents (`PreToolUse`, matcher `Bash|PowerShell`)
 
